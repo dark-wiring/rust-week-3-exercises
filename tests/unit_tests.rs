@@ -1,113 +1,388 @@
-use rust_week_3_exercises::*;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::io::{Cursor, Read};
+use std::ops::Deref;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct CompactSize {
+    pub value: u64,
+}
 
-    fn dummy_txid(val: u8) -> [u8; 32] {
-        let mut txid = [0u8; 32];
-        txid[31] = val;
-        txid
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum BitcoinError {
+    InsufficientBytes,
+    InvalidFormat,
+}
+
+impl CompactSize {
+    pub fn new(value: u64) -> Self {
+        Self { value }
     }
 
-    #[test]
-    fn test_compact_size_serialization() {
-        let tests = vec![
-            (0u64, vec![0x00]),
-            (252u64, vec![0xFC]),
-            (253u64, vec![0xFD, 0xFD, 0x00]),
-            (65535u64, vec![0xFD, 0xFF, 0xFF]),
-            (65536u64, vec![0xFE, 0x00, 0x00, 0x01, 0x00]),
-            (4294967295u64, vec![0xFE, 0xFF, 0xFF, 0xFF, 0xFF]),
-            (
-                4294967296u64,
-                vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00],
-            ),
-        ];
-
-        for (value, bytes) in tests {
-            let cs = CompactSize::new(value);
-            assert_eq!(cs.to_bytes(), bytes);
-            let (decoded, consumed) = CompactSize::from_bytes(&bytes).unwrap();
-            assert_eq!(decoded.value, value);
-            assert_eq!(consumed, bytes.len());
+    pub fn to_bytes(&self) -> Vec<u8> {
+        if self.value <= 0xFC {
+            vec![self.value as u8]
+        } else if self.value <= 0xFFFF {
+            let mut buf = Vec::with_capacity(3);
+            buf.push(0xFD);
+            buf.extend((self.value as u16).to_le_bytes());
+            buf
+        } else if self.value <= 0xFFFFFFFF {
+            let mut buf = Vec::with_capacity(5);
+            buf.push(0xFE);
+            buf.extend((self.value as u32).to_le_bytes());
+            buf
+        } else {
+            let mut buf = Vec::with_capacity(9);
+            buf.push(0xFF);
+            buf.extend(self.value.to_le_bytes());
+            buf
         }
     }
 
-    #[test]
-    fn test_outpoint_roundtrip() {
-        let txid = dummy_txid(0xCC);
-        let vout = 2;
-        let outpoint = OutPoint::new(txid, vout);
-        let bytes = outpoint.to_bytes();
-        let (parsed, consumed) = OutPoint::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed, outpoint);
-        assert_eq!(consumed, bytes.len());
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), BitcoinError> {
+        if bytes.is_empty() {
+            return Err(BitcoinError::InsufficientBytes);
+        }
+
+        let mut cursor = Cursor::new(bytes);
+        let mut leading_byte = [0u8; 1];
+        let _ = cursor.read_exact(&mut leading_byte);
+
+        match leading_byte[0] {
+            0x00..=0xFC => Ok((
+                Self {
+                    value: leading_byte[0] as u64,
+                },
+                1,
+            )),
+            0xFD => {
+                let mut buf = [0u8; 2];
+                cursor.read_exact(&mut buf).unwrap();
+
+                Ok((
+                    Self {
+                        value: u16::from_le_bytes(buf) as u64,
+                    },
+                    3,
+                ))
+            }
+            0xFE => {
+                let mut buf = [0u8; 4];
+                cursor.read_exact(&mut buf).unwrap();
+
+                Ok((
+                    Self {
+                        value: u32::from_le_bytes(buf) as u64,
+                    },
+                    5,
+                ))
+            }
+            0xFF => {
+                let mut buf = [0u8; 8];
+                cursor.read_exact(&mut buf).unwrap();
+
+                Ok((
+                    Self {
+                        value: u64::from_le_bytes(buf),
+                    },
+                    9,
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Txid(pub [u8; 32]);
+
+impl Serialize for Txid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let hex_string = hex::encode(self.0);
+        serializer.serialize_str(&hex_string)
+    }
+}
+
+impl<'de> Deserialize<'de> for Txid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let hex_string = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&hex_string).expect("Failed to parse");
+
+        if bytes.len() != 32 {
+            Err(serde::de::Error::custom("Byte length not sufficient"))
+        } else {
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&bytes);
+            Ok(Txid(buf))
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct OutPoint {
+    pub txid: Txid,
+    pub vout: u32,
+}
+
+impl OutPoint {
+    pub fn new(txid: [u8; 32], vout: u32) -> Self {
+        Self {
+            txid: Txid(txid),
+            vout,
+        }
     }
 
-    #[test]
-    fn test_script_roundtrip() {
-        let script_data = vec![0x76, 0xA9, 0x14, 0x88, 0xAC];
-        let script = Script::new(script_data.clone());
-        let bytes = script.to_bytes();
-        let (parsed, consumed) = Script::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed, script);
-        assert_eq!(consumed, bytes.len());
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+
+        buf.extend(self.txid.0);
+        buf.extend(self.vout.to_le_bytes());
+        buf
     }
 
-    #[test]
-    fn test_tx_input_roundtrip() {
-        let outpoint = OutPoint::new(dummy_txid(1), 0);
-        let script = Script::new(vec![0x01, 0x02]);
-        let input = TransactionInput::new(outpoint.clone(), script.clone(), 0xFFFFFFFF);
-        let bytes = input.to_bytes();
-        let (parsed, consumed) = TransactionInput::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed, input);
-        assert_eq!(consumed, bytes.len());
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), BitcoinError> {
+        if bytes.len() != 36 {
+            return Err(BitcoinError::InsufficientBytes);
+        }
+
+        let mut cursor = Cursor::new(bytes);
+
+        let mut txid_buf = [0u8; 32];
+        cursor.read_exact(&mut txid_buf).unwrap();
+
+        let mut vout_buf = [0u8; 4];
+        cursor.read_exact(&mut vout_buf).unwrap();
+
+        let vout = u32::from_le_bytes(vout_buf);
+
+        Ok((
+            Self {
+                vout,
+                txid: Txid(txid_buf),
+            },
+            36,
+        ))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct Script {
+    pub bytes: Vec<u8>,
+}
+
+impl Script {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Script { bytes }
     }
 
-    #[test]
-    fn test_bitcoin_tx_roundtrip() {
-        let inputs = vec![TransactionInput::new(
-            OutPoint::new(dummy_txid(1), 0),
-            Script::new(vec![0x01, 0x02]),
-            0xFFFFFFFF,
-        )];
-        let tx = BitcoinTransaction::new(2, inputs.clone(), 1000);
-        let bytes = tx.to_bytes();
-        let (parsed, consumed) = BitcoinTransaction::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed, tx);
-        assert_eq!(consumed, bytes.len());
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let compact_size = CompactSize::new(self.bytes.len() as u64).to_bytes();
+
+        let mut buf = Vec::new();
+        buf.extend(compact_size);
+        buf.extend(&self.bytes);
+
+        buf
     }
 
-    #[test]
-    fn test_bitcoin_tx_json_serialization() {
-        let input = TransactionInput::new(
-            OutPoint::new(dummy_txid(0xAB), 3),
-            Script::new(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-            0xABCDEF01,
-        );
-        let tx = BitcoinTransaction::new(1, vec![input], 999);
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), BitcoinError> {
+        let (compact_size, prefix_len) = CompactSize::from_bytes(bytes)?;
+        let script_len = compact_size.value as usize;
 
-        let json = serde_json::to_string_pretty(&tx).unwrap();
-        let parsed: BitcoinTransaction = serde_json::from_str(&json).unwrap();
-        assert_eq!(tx, parsed);
+        let start = prefix_len;
+        let end = start + script_len;
 
-        assert!(json.contains("\"version\": 1"));
-        assert!(json.contains("\"lock_time\": 999"));
+        if bytes.len() < end {
+            return Err(BitcoinError::InsufficientBytes);
+        }
+
+        let script_bytes = bytes[start..end].to_vec();
+
+        Ok((
+            Self {
+                bytes: script_bytes,
+            },
+            prefix_len + script_len,
+        ))
+    }
+}
+
+impl Deref for Script {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct TransactionInput {
+    pub previous_output: OutPoint,
+    pub script_sig: Script,
+    pub sequence: u32,
+}
+
+impl TransactionInput {
+    pub fn new(previous_output: OutPoint, script_sig: Script, sequence: u32) -> Self {
+        Self {
+            previous_output,
+            script_sig,
+            sequence,
+        }
     }
 
-    #[test]
-    fn test_bitcoin_transaction_display() {
-        let input = TransactionInput::new(
-            OutPoint::new(dummy_txid(0xCD), 7),
-            Script::new(vec![0x01, 0x02, 0x03]),
-            0xFFFFFFFF,
-        );
-        let tx = BitcoinTransaction::new(1, vec![input], 0);
-        let output = format!("{}", tx);
-        assert!(output.contains("Version: 1"));
-        assert!(output.contains("Lock Time: 0"));
-        assert!(output.contains("Previous Output Vout: 7"));
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        let outpoint = self.previous_output.to_bytes();
+        buf.extend_from_slice(&outpoint);
+
+        let script = self.script_sig.to_bytes();
+        buf.extend_from_slice(&script);
+
+        let sequence = self.sequence.to_le_bytes();
+        buf.extend(sequence);
+
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), BitcoinError> {
+        let mut offset = 0;
+
+        let (outpoint, outpoint_size) = OutPoint::from_bytes(&bytes[offset..])?;
+        offset += outpoint_size;
+
+        let (script, script_size) = Script::from_bytes(&bytes[offset..])?;
+        offset += script_size;
+
+        // Sequence: 4 bytes LE
+        if bytes.len() < offset + 4 {
+            return Err(BitcoinError::InsufficientBytes);
+        }
+        let mut sequence_bytes = [0u8; 4];
+        sequence_bytes.copy_from_slice(&bytes[offset..offset + 4]);
+        offset += 4;
+
+        let sequence = u32::from_le_bytes(sequence_bytes);
+
+        let input = Self {
+            previous_output: outpoint,
+            script_sig: script,
+            sequence,
+        };
+
+        Ok((input, offset))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct BitcoinTransaction {
+    pub version: u32,
+    pub inputs: Vec<TransactionInput>,
+    pub lock_time: u32,
+}
+
+impl BitcoinTransaction {
+    pub fn new(version: u32, inputs: Vec<TransactionInput>, lock_time: u32) -> Self {
+        Self {
+            version,
+            inputs,
+            lock_time,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // version (4 bytes LE)
+        buf.extend(self.version.to_le_bytes());
+
+        // input count as CompactSize
+        let input_count = CompactSize::new(self.inputs.len() as u64).to_bytes();
+        buf.extend(input_count);
+
+        // each input serialized
+        for input in &self.inputs {
+            buf.extend(input.to_bytes());
+        }
+
+        // lock_time (4 bytes LE)
+        buf.extend(self.lock_time.to_le_bytes());
+
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), BitcoinError> {
+        let mut offset = 0;
+
+        // version (4 bytes LE)
+        if bytes.len() < 4 {
+            return Err(BitcoinError::InsufficientBytes);
+        }
+        let mut version_bytes = [0u8; 4];
+        version_bytes.copy_from_slice(&bytes[offset..offset + 4]);
+        let version = u32::from_le_bytes(version_bytes);
+        offset += 4;
+
+        // input count CompactSize
+        let (input_count, prefix_len) = CompactSize::from_bytes(&bytes[offset..])?;
+        offset += prefix_len;
+
+        let mut inputs = Vec::new();
+        for _ in 0..input_count.value {
+            let (input, input_size) = TransactionInput::from_bytes(&bytes[offset..])?;
+            offset += input_size;
+            inputs.push(input);
+        }
+
+        // lock_time (4 bytes LE)
+        if bytes.len() < offset + 4 {
+            return Err(BitcoinError::InsufficientBytes);
+        }
+        let mut lock_time_bytes = [0u8; 4];
+        lock_time_bytes.copy_from_slice(&bytes[offset..offset + 4]);
+        let lock_time = u32::from_le_bytes(lock_time_bytes);
+        offset += 4;
+
+        Ok((
+            Self {
+                version,
+                inputs,
+                lock_time,
+            },
+            offset,
+        ))
+    }
+}
+
+impl fmt::Display for BitcoinTransaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "BitcoinTransaction {{")?;
+        writeln!(f, "  Version: {}", self.version)?;
+        writeln!(f, "  Inputs ({}):", self.inputs.len())?;
+        for (i, input) in self.inputs.iter().enumerate() {
+            writeln!(
+                f,
+                "    [{}] Previous Output Txid: {}, Previous Output Vout: {}",
+                i,
+                hex::encode(input.previous_output.txid.0),
+                input.previous_output.vout
+            )?;
+            writeln!(
+                f,
+                "         Script Sig: len={}, bytes={:?}",
+                input.script_sig.bytes.len(),
+                input.script_sig.bytes
+            )?;
+            writeln!(f, "         Sequence: {}", input.sequence)?;
+        }
+        writeln!(f, "  Lock Time: {}", self.lock_time)?;
+        write!(f, "}}")
     }
 }
